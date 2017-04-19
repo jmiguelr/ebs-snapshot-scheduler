@@ -23,38 +23,48 @@ ec2_client = boto3.client('ec2')
 cf_client = boto3.client('cloudformation')
 
 
+def backup_volume(ec2, volume_obj, retention_days, history_table, aws_region):
+    print "Taking snapshot of volume ", volume_obj.id
+    current_time = datetime.datetime.utcnow()
+    current_time_str = current_time.strftime(
+        "%h %d,%H:%M")
+    attached_instance_id = volume_obj.attachments[0]['InstanceId']
+    description = """Created by EBSSnapshotScheduler from %s (%s) at %s UTC""" % (
+        volume_obj.id, attached_instance_id, current_time_str)
+
+    # Calculate purge time on the basis of retention_days setting.
+    # If AutoSnapshotDeletion is yes, retention_days value will be integer, otherwise, it will be NA
+    if is_int(retention_days):
+        purge_time = current_time + datetime.timedelta(days=retention_days)
+    else:
+        purge_time = retention_days
+
+    # schedule snapshot creation.
+    try:
+        snapshot = ec2.create_snapshot(
+            VolumeId=volume_obj.id, Description=description)
+
+        snapshot_entry = {
+            'snapshot_id': snapshot.id,
+            'region': aws_region,
+            'instance_id': attached_instance_id,
+            'volume_id': volume_obj.id,
+            'size': volume_obj.size,
+            'purge_time': str(purge_time),
+            'start_time': str(current_time)
+        }
+
+        response = history_table.put_item(Item=snapshot_entry)
+    except Exception as e:
+        print e
+    return snapshot
+
+
 def backup_instance(ec2, instance_obj, retention_days, history_table, aws_region):
     new_snapshot_list = []
     for volume in instance_obj.volumes.all():
-        current_time = datetime.datetime.utcnow()
-        current_time_str = current_time.strftime(
-            "%h %d,%H:%M")
-        description = """Created by EBSSnapshotScheduler from %s(%s) at %s UTC""" % (
-            volume.id, instance_obj.instance_id, current_time_str)
-
-        # Calculate purge time on the basis of retention_days setting.
-        # If AutoSnapshotDeletion is yes, retention_days value will be integer, otherwise, it will be NA
-        if is_int(retention_days):
-            purge_time = current_time + datetime.timedelta(days=retention_days)
-        else:
-            purge_time = retention_days
-
-        # schedule snapshot creation.
         try:
-            snapshot = ec2.create_snapshot(
-                VolumeId=volume.id, Description=description)
-
-            snapshot_entry = {
-                'snapshot_id': snapshot.id,
-                'region': aws_region,
-                'instance_id': instance_obj.instance_id,
-                'volume_id': volume.id,
-                'size': volume.size,
-                'purge_time': str(purge_time),
-                'start_time': str(current_time)
-            }
-
-            response = history_table.put_item(Item=snapshot_entry)
+            snapshot = backup_volume(ec2, volume, retention_days, history_table, aws_region)
             new_snapshot_list.append(snapshot.id)
         except Exception as e:
             print e
@@ -261,9 +271,11 @@ def lambda_handler(event, context):
 
             # Declare Lists
             snapshot_list = []
+            volume_snapshot_list = []
             agg_snapshot_list = []
             snapshots = []
             retention_period_per_instance = {}
+            retention_period_per_volume = {}
 
             # Filter Instances for Scheduler Tag
             instances = ec2_resource.instances.all()
@@ -310,6 +322,53 @@ def lambda_handler(event, context):
                                             active_day is True:
                                 snapshot_list.append(i.instance_id)
                                 retention_period_per_instance[i.instance_id] = retention_days
+
+            # Filter Volumes for Scheduler Tag
+            volumes = ec2_resource.volumes.all()
+
+            for v in volumes:
+                if v.tags != None:
+                    for t in v.tags:
+                        if t['Key'][:custom_tag_length] == custom_tag_name:
+                            tag = t['Value']
+
+                            # Split out Tag & Set Variables to default
+                            default1 = 'default'
+                            default2 = 'true'
+                            snapshot_time = default_snapshot_time
+                            retention_days = default_retention_days
+                            time_zone = default_time_zone
+                            days_active = default_days_active
+
+                            # First value will always be defaults or start_time.
+                            parse_tag_values(tag, default1, default2, default_snapshot_time)
+
+                            tz = pytz.timezone(time_zone)
+                            now = utc_time.replace(tzinfo=pytz.utc).astimezone(tz).strftime("%H%M")
+                            now_max = utc_time.replace(tzinfo=pytz.utc).astimezone(tz) - time_delta
+                            now_max = now_max.strftime("%H%M")
+                            now_day = utc_time.replace(tzinfo=pytz.utc).astimezone(tz).strftime("%a").lower()
+                            active_day = False
+
+                            # Days Interpreter
+                            if days_active == "all":
+                                active_day = True
+                            elif days_active == "weekdays":
+                                weekdays = ['mon', 'tue', 'wed', 'thu', 'fri']
+                                if now_day in weekdays:
+                                    active_day = True
+                            else:
+                                days_active = days_active.split(",")
+                                for d in days_active:
+                                    if d.lower() == now_day:
+                                        active_day = True
+
+                            # Append to start list
+                            if snapshot_time >= str(now_max) and snapshot_time <= str(now) and \
+                                            active_day is True:
+                                volume_snapshot_list.append(v.volume_id)
+                                retention_period_per_volume[v.volume_id] = retention_days
+
             deleted_snapshot_count = 0
 
             if auto_snapshot_deletion == "yes":
@@ -338,7 +397,25 @@ def lambda_handler(event, context):
                 if agg_snapshot_list:
                     tag_snapshots(ec2, agg_snapshot_list)
             else:
-                print "No new snapshots taken."
+                print "No new instance snapshots taken."
+
+            if volume_snapshot_list:
+                print "Taking snapshot of ", len(volume_snapshot_list), " volume(s)", volume_snapshot_list
+                for volume in ec2_resource.volumes.filter(VolumeIds=volume_snapshot_list):
+                    if auto_snapshot_deletion == "no":
+                        retention_days = "NA"
+                    else:
+                        for key, value in retention_period_per_volume.iteritems():
+                            if key == volume.id:
+                                retention_days = value
+                    new_snapshot = backup_volume(ec2_resource, volume, retention_days, history_table, aws_region)
+                    agg_snapshot_list.append(new_snapshot.id)
+                print "Number of new volume snapshots created:", len(agg_snapshot_list)
+                if agg_snapshot_list:
+                    tag_snapshots(ec2, agg_snapshot_list)
+            else:
+                print "No new volume snapshots taken."
+
 
             # Build payload for each region
             if send_data == "yes":
